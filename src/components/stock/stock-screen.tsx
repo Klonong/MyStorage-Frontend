@@ -12,13 +12,16 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { simData, useActiveSite, useWarehouse } from "@/hooks/useWarehouse";
-import type { CountTask, ReturnCase, Transfer } from "@/interfaces/warehouse.interface";
+import type { CountTask, LiveSite, ReturnCase, Transfer } from "@/interfaces/warehouse.interface";
 import { slotOf } from "@/lib/describe";
 import { countAccuracy } from "@/lib/simulator";
 import { clockAt, fmt, palletStatus } from "@/lib/status";
 import { cn } from "@/lib/utils";
+import { LotsTab } from "./lots-tab";
+import { WavesTab } from "./waves-tab";
 
-const zoneNames: Record<string, string> = { A: "Zone A: PPE", B: "Zone B: Lighting", C: "Zone C: Furniture", D: "Zone D: Packaging" };
+/** Zone pick list from the site layout, e.g. "Zone A: PPE". */
+const zoneNamesOf = (live: LiveSite) => Object.fromEntries(live.site.layout.zones.map((z) => [z.code, `Zone ${z.code}: ${z.name}`]));
 const classNames: Record<string, string> = { A: "Class A: top movers", B: "Class B: middle", C: "Class C: slow" };
 
 function Labeled({ label, htmlFor, children }: { label: string; htmlFor?: string; children: React.ReactNode }) {
@@ -59,7 +62,8 @@ function NewCount() {
   const create = useWarehouse((s) => s.createCount);
   const live = useActiveSite();
   const [scope, setScope] = useState<"zone" | "class">("zone");
-  const [target, setTarget] = useState("A");
+  const zoneNames = zoneNamesOf(live);
+  const [target, setTarget] = useState(live.site.layout.zones[0]?.code ?? "A");
   const [blind, setBlind] = useState(true);
   const accuracy = countAccuracy(live);
   return (
@@ -108,6 +112,7 @@ function NewCount() {
 function CountCard({ task }: { task: CountTask }) {
   const approve = useWarehouse((s) => s.approveCount);
   const startedAt = useWarehouse((s) => s.startedAt);
+  const zoneNames = zoneNamesOf(useActiveSite());
   const counted = task.lines.filter((l) => l.counted !== null).length;
   const hide = task.blind && task.status === "open";
   const status =
@@ -126,7 +131,7 @@ function CountCard({ task }: { task: CountTask }) {
         <div className="leading-tight">
           <p className="font-semibold">{task.id}</p>
           <p className="text-xs text-muted-foreground">
-            {(task.scope === "zone" ? zoneNames : classNames)[task.target]}
+            {(task.scope === "zone" ? zoneNames : classNames)[task.target] ?? `Zone ${task.target}`}
             {task.blind ? ", blind" : ""}, opened {clockAt(startedAt, task.createdAt)}
           </p>
         </div>
@@ -445,14 +450,22 @@ function CrossDockTab() {
 export function StockScreen() {
   const live = useActiveSite();
   return (
-    <AppShell title="Stock" subtitle={`${live.site.name}: counts, returns, transfers and cross-dock`}>
-      <Tabs defaultValue="counts">
+    <AppShell title="Stock" subtitle={`${live.site.name}: lots, waves, counts, returns, transfers and cross-dock`}>
+      <Tabs defaultValue="lots">
         <TabsList className="mb-2">
+          <TabsTrigger value="lots">Lots</TabsTrigger>
+          <TabsTrigger value="waves">Waves</TabsTrigger>
           <TabsTrigger value="counts">Cycle counts</TabsTrigger>
           <TabsTrigger value="returns">Returns</TabsTrigger>
           <TabsTrigger value="transfers">Transfers</TabsTrigger>
           <TabsTrigger value="crossdock">Cross-dock</TabsTrigger>
         </TabsList>
+        <TabsContent value="lots">
+          <LotsTab />
+        </TabsContent>
+        <TabsContent value="waves">
+          <WavesTab />
+        </TabsContent>
         <TabsContent value="counts">
           <CountsTab />
         </TabsContent>

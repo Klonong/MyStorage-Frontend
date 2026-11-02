@@ -26,11 +26,11 @@ export const palette = {
   accent: "#2563eb",
 };
 
-export function Block({ size, position, color, cast = true, rotation, roughness = 0.85 }: { size: V3; position: V3; color: string; cast?: boolean; rotation?: V3; roughness?: number }) {
+export function Block({ size, position, color, cast = true, rotation, roughness = 0.85, glow }: { size: V3; position: V3; color: string; cast?: boolean; rotation?: V3; roughness?: number; glow?: string }) {
   return (
     <mesh position={position} rotation={rotation} castShadow={cast} receiveShadow>
       <boxGeometry args={size} />
-      <meshStandardMaterial color={color} roughness={roughness} />
+      <meshStandardMaterial color={color} roughness={roughness} emissive={glow ?? "#000000"} emissiveIntensity={glow ? 1 : 0} />
     </mesh>
   );
 }
@@ -108,5 +108,15 @@ export function Pin({ y, color }: { y: number; color: string }) {
         </mesh>
       </Billboard>
     </group>
+  );
+}
+
+/** Warm light on the ground under a lamp at night; cheaper than a real light per lamp. */
+export function LightPool({ x, z, r }: { x: number; z: number; r: number }) {
+  return (
+    <mesh position={[x, 0.045, z]} rotation={[-Math.PI / 2, 0, 0]} renderOrder={1}>
+      <circleGeometry args={[r, 28]} />
+      <meshBasicMaterial color="#ffd889" transparent opacity={0.22} depthWrite={false} />
+    </mesh>
   );
 }

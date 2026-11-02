@@ -29,7 +29,8 @@ function RulesForm({ onDone }: { onDone: () => void }) {
     <form
       onSubmit={(e) => {
         e.preventDefault();
-        setRules(rules);
+        const err = setRules(rules);
+        if (err) return void toast.error(err);
         toast.success(`Alert rules saved for ${live.site.name}`);
         onDone();
       }}

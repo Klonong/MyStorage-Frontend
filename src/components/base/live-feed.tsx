@@ -3,7 +3,8 @@
 import { useEffect } from "react";
 import { useWarehouse } from "@/hooks/useWarehouse";
 
-const TICK_SECONDS = 0.25;
+/** Simulator update interval; the map glides each model across one interval. */
+export const TICK_SECONDS = 0.25;
 
 /**
  * Drives the simulated live feed. Mounted once in the root layout, so the

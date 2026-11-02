@@ -8,6 +8,8 @@ export interface CatalogItem {
   category: string;
   qtyPerPallet: number;
   kgPerPallet: number;
+  /** Set for items that expire; their lots get an expiry date and ship FEFO. */
+  shelfLifeMonths?: number;
 }
 
 export interface SiteSeed {
@@ -47,11 +49,11 @@ export interface SiteSeed {
 }
 
 export const catalog: CatalogItem[] = [
-  { sku: "PPE-HLM-Y", item: "Safety Helmet", category: "PPE", qtyPerPallet: 82, kgPerPallet: 56 },
+  { sku: "PPE-HLM-Y", item: "Safety Helmet", category: "PPE", qtyPerPallet: 82, kgPerPallet: 56, shelfLifeMonths: 60 },
   { sku: "LGT-LED-60", item: "LED Panel 60×60", category: "Lighting", qtyPerPallet: 40, kgPerPallet: 180 },
   { sku: "FUR-CHR-01", item: "Office Chair", category: "Furniture", qtyPerPallet: 12, kgPerPallet: 210 },
   { sku: "PKG-BOX-M", item: "Cardboard Box (M)", category: "Packaging", qtyPerPallet: 250, kgPerPallet: 120 },
-  { sku: "PPE-GLV-N", item: "Nitrile Gloves", category: "PPE", qtyPerPallet: 600, kgPerPallet: 140 },
+  { sku: "PPE-GLV-N", item: "Nitrile Gloves", category: "PPE", qtyPerPallet: 600, kgPerPallet: 140, shelfLifeMonths: 36 },
 ];
 
 /** Rotated through for trucks the simulator spawns after the seeded ones. */

@@ -13,13 +13,19 @@ import type {
   Visit,
   DockDoor,
   Forklift,
+  Frame,
   LiveSite,
+  Lot,
+  PickLine,
+  PositionTag,
   Pallet,
   Shipment,
   SiteAlert,
   SiteLayout,
   Truck,
   Vec2,
+  Wave,
+  Zone,
 } from "@/interfaces/warehouse.interface";
 
 export interface SimData {
@@ -48,6 +54,14 @@ const APPOINTMENT_GAP = 85;
 export const DELIVERY_AFTER = 90;
 /** How long a booked slot holds its door on the schedule. */
 export const SLOT_WINDOW = 70;
+// ponytail: one demo hour is one sim minute, so engine hours and the 24 h replay play out during a demo; real telematics report wall-clock hours.
+export const SIM_HOUR = 60;
+export const SERVICE_INTERVAL = 250;
+/** Replay snapshot spacing and how far back it reaches. */
+const FRAME_EVERY = 2;
+const REPLAY_SPAN = 24 * SIM_HOUR;
+/** BLE fixes wander about this far (metres); UWB is treated as exact. */
+const BLE_ERROR = 1.5;
 
 // ponytail: thresholds run on the demo clock, which compresses a shift into minutes; real values come with the backend.
 export const defaultRules: AlertRules = {
@@ -61,12 +75,30 @@ export const defaultRules: AlertRules = {
 
 // ---------- layout geometry ----------
 
+/** Metres inside the dock doors kept free of racks, for staging and forklift turns. */
+export const DOCK_STRIP = 5;
+
 export function buildLayout(seed: SiteSeed): SiteLayout {
   const { width: w, depth: d } = seed.building;
   const n = seed.doors.length;
   const roadZ = d / 2 + 30;
+  // Four storage zones across the hall, keeping the strip inside the dock doors clear for staging.
+  const zw = (w - 5) / 4;
+  const stores = ["PPE", "Lighting", "Furniture", "Packaging"];
   return {
     building: seed.building,
+    zones: stores.map((category, i) => ({
+      id: `${seed.id}-zone-${i}`,
+      code: "ABCD"[i],
+      name: category,
+      stores: category,
+      x: -w / 2 + 1 + i * (zw + 1),
+      z: -d / 2 + 1,
+      w: zw,
+      d: d - 1 - DOCK_STRIP,
+      aisles: Math.max(1, Math.floor(zw / 3)),
+      levels: category === "Furniture" ? 3 : 4,
+    })),
     doors: seed.doors.map((door, i) => ({
       id: `${seed.id}-door-${i}`,
       code: door.code,
@@ -161,7 +193,7 @@ function shipmentFor(
       ? { label, at: t - (stage - i) * 720, eta: null }
       : { label, at: null, eta: t + (i - stage + 1) * (i >= 3 ? 1500 : 240) },
   );
-  return { id, direction, party, place, steps };
+  return { id, direction, party, place, steps, manifest: [] };
 }
 
 function newPallet(live: LiveSite, item: CatalogItem, slotId: string | null): Pallet {
@@ -306,6 +338,7 @@ export function createLiveSite(seed: SiteSeed, data: SimData): LiveSite {
   const forklifts: Forklift[] = seed.forklifts.map((f, i) => {
     const chargerId = layout.chargers[i].id;
     const home = homeOf(layout, chargerId);
+    const engineHours = 1840 + ((idNum(f.id) * 613) % 1400);
     return {
       id: f.id,
       driver: f.driver,
@@ -324,6 +357,13 @@ export function createLiveSite(seed: SiteSeed, data: SimData): LiveSite {
       carrying: null,
       trip: null,
       waitUntil: 0,
+      engineHours,
+      // The second forklift at each site is a few working hours from its service, so the alert shows in a demo.
+      serviceDueAt: Math.round(engineHours) + (i === 1 ? 3 : 60 + i * 45),
+      // Pilot mix for the UWB-or-BLE question: one of each, the rest untagged.
+      tag: i === 0 ? "uwb" : i === 1 ? "ble" : null,
+      lastScan: { pos: home, at: 0 },
+      shown: home,
     };
   });
 
@@ -373,13 +413,15 @@ export function createLiveSite(seed: SiteSeed, data: SimData): LiveSite {
     forklifts,
     pallets,
     shipments,
-    inventory: seed.inventory.map((line) => ({ ...line, item: item(line.sku).item, category: item(line.sku).category })),
+    inventory: seed.inventory.map((line, i) => ({ ...line, item: item(line.sku).item, category: item(line.sku).category, lots: seedLots(item(line.sku), line.qty, i, n) })),
     alerts: [],
     stats: { ...seed.stats, palletsIn: past.palletsIn, palletsOut: past.palletsOut, crossDocked: 0, returnsRestocked: 0, returnsScrapped: 0 },
     counts: [],
     returns: past.returns,
+    waves: [],
     visits: past.visits,
     history: past.history,
+    frames: [],
     appointments,
     rules: defaultRules,
     autoCheckIn: true,
@@ -439,7 +481,52 @@ function checkInTruck(live: LiveSite, truck: Truck, byGuard: boolean) {
   alert(live, "info", `${truck.id} checked in${byGuard ? " by the gatehouse" : ""}, heading to ${door.code}`);
 }
 
-function adjustStock(live: LiveSite, sku: string, pallets: number, data: SimData, units?: number) {
+// ---------- lots ----------
+
+// ponytail: expiry dates count from a fixed calendar day so runs repeat exactly; the backend stamps real receipt dates.
+export const LOT_BASE = Date.UTC(2026, 10, 1);
+const monthsAhead = (months: number) => {
+  const d = new Date(LOT_BASE);
+  d.setUTCMonth(d.getUTCMonth() + months);
+  return d.toISOString().slice(0, 10);
+};
+const expiryFor = (item: CatalogItem, seed: number) => (item.shelfLifeMonths ? monthsAhead(item.shelfLifeMonths - (seed % 6)) : null);
+
+/** Lots in shipping order: earliest expiry first (FEFO), then earliest received (FIFO). Empty lots dropped. */
+export const fefo = (lots: Lot[]) =>
+  lots.filter((l) => l.qty > 0).sort((a, b) => (a.expires ?? "9999").localeCompare(b.expires ?? "9999") || a.receivedAt - b.receivedAt);
+
+/** Two lots per seeded line; on alternate lines the newer lot expires first, so FEFO and FIFO disagree. */
+function seedLots(item: CatalogItem, qty: number, i: number, n: number): Lot[] {
+  const older = Math.floor((qty * 0.4) / item.qtyPerPallet) * item.qtyPerPallet;
+  const lot = (k: number) => `L24${n}${i}-${100 + k * 37}`;
+  const exp = (months: number) => (item.shelfLifeMonths ? monthsAhead(months) : null);
+  return [
+    { lot: lot(1), expires: exp(i % 2 ? 30 : 5), receivedAt: -40000 - i * 900, qty: older },
+    { lot: lot(2), expires: exp(i % 2 ? 8 : 28), receivedAt: -9000 - i * 600, qty: qty - older },
+  ].filter((l) => l.qty > 0);
+}
+
+/** Applies a stock change to lots: receipts go to their lot (or the newest), issues come from their lot, then FEFO. */
+function moveLots(lots: Lot[], delta: number, item: CatalogItem, t: number, seed: number, lot?: string): Lot[] {
+  const out = lots.map((l) => ({ ...l }));
+  if (delta > 0) {
+    const target = lot ? out.find((l) => l.lot === lot) : [...out].sort((a, b) => b.receivedAt - a.receivedAt)[0];
+    if (target) target.qty += delta;
+    else out.push({ lot: lot ?? `ADJ-${Math.round(t)}`, expires: expiryFor(item, seed), receivedAt: t, qty: delta });
+  } else {
+    let left = -delta;
+    for (const l of [...out.filter((x) => x.lot === lot), ...fefo(out).filter((x) => x.lot !== lot)]) {
+      const take = Math.min(left, l.qty);
+      l.qty -= take;
+      left -= take;
+      if (!left) break;
+    }
+  }
+  return out.filter((l) => l.qty > 0);
+}
+
+function adjustStock(live: LiveSite, sku: string, pallets: number, data: SimData, units?: number, lot?: string) {
   const item = data.catalog.find((c) => c.sku === sku);
   if (!item) return;
   live.stats = {
@@ -451,11 +538,12 @@ function adjustStock(live: LiveSite, sku: string, pallets: number, data: SimData
   };
   live.inventory = live.inventory.map((line) => {
     if (line.sku !== sku) return line;
-    const qty = Math.max(0, line.qty + (units ?? pallets * item.qtyPerPallet));
+    const lots = moveLots(line.lots, units ?? pallets * item.qtyPerPallet, item, live.t, live.seq, lot);
+    const qty = lots.reduce((sum, l) => sum + l.qty, 0);
     if (live.rules.lowStock.on && line.qty >= line.lowStock && qty < line.lowStock) {
       alert(live, "warning", `${line.item} below low-stock threshold (${qty.toLocaleString("en-US")} / ${line.lowStock.toLocaleString("en-US")})`);
     }
-    return { ...line, qty };
+    return { ...line, qty, lots };
   });
 }
 
@@ -559,6 +647,7 @@ function stepTruck(live: LiveSite, truck: Truck, dt: number): boolean {
           live.stats = { ...live.stats, arrivalsToday: live.stats.arrivalsToday + 1 };
         } else {
           stamp(live, truck.shipmentId, "In transit");
+          alert(live, "info", `${truck.id} dispatched with a ${live.shipments[truck.shipmentId]?.manifest.length ?? 0}-pallet load manifest`);
           live.deliveries = [...live.deliveries, { shipmentId: truck.shipmentId, at: live.t + DELIVERY_AFTER }];
           live.stats = { ...live.stats, outboundToday: live.stats.outboundToday + 1 };
         }
@@ -648,7 +737,8 @@ function startTrip(live: LiveSite, f: Forklift) {
       return;
     }
     const elsewhere = (p: Pallet) => p.crossDockFor !== null && p.crossDockFor !== truck.id && live.trucks.some((t) => t.id === p.crossDockFor && t.status !== "departing");
-    const candidates = truck.sku ? [] : live.pallets.filter((p) => p.slotId && p.status !== "qc-hold" && !reserved.has(p.slotId) && !elsewhere(p));
+    // Transfer legs and waved orders ship exactly what was allocated, so they pick from storage, not the yard.
+    const candidates = truck.sku || waved(live, truck.appointmentId) ? [] : live.pallets.filter((p) => p.slotId && p.status !== "qc-hold" && !reserved.has(p.slotId) && !elsewhere(p));
     const pallet = candidates.find((p) => p.crossDockFor === truck.id) ?? candidates[0];
     const slot = pallet && layout.slots.find((s) => s.id === pallet.slotId);
     f.trip = { truckId: truck.id, slotId: slot ? slot.id : "storage", next: "pick" };
@@ -668,6 +758,8 @@ function arrive(live: LiveSite, f: Forklift, data: SimData) {
   const door = truck && layout.doors.find((d) => d.id === truck.doorId);
   const slot = layout.slots.find((s) => s.id === trip.slotId);
   f.waitUntil = live.t + HANDLING;
+  // Every pick and drop is a pallet scan, which fixes the forklift's position.
+  f.lastScan = { pos: f.pos, at: live.t };
 
   if (trip.next === "pick") {
     let pallet: Pallet | undefined;
@@ -678,8 +770,9 @@ function arrive(live: LiveSite, f: Forklift, data: SimData) {
       pallet = newPallet(live, data.catalog.find((c) => c.sku === truck.sku) ?? data.catalog[live.seq % data.catalog.length], null);
       truck.cargo = { ...truck.cargo, done: truck.cargo.done + 1, kgPerPallet: pallet.weightKg };
     } else if (truck?.status === "loading") {
-      const line = live.inventory.find((l) => l.sku === truck.sku) ?? [...live.inventory].sort((a, b) => b.qty - a.qty)[0];
-      pallet = { ...newPallet(live, data.catalog.find((c) => c.sku === line.sku) ?? data.catalog[0], null), status: "loading" };
+      const next = nextFromStorage(live, truck, data);
+      const fresh = newPallet(live, next.item, null);
+      pallet = { ...fresh, lot: next.lot ?? fresh.lot, status: "loading" };
     }
     if (!pallet) {
       f.trip = null;
@@ -704,7 +797,8 @@ function arrive(live: LiveSite, f: Forklift, data: SimData) {
     live.pallets = live.pallets.filter((p) => p.id !== pallet.id);
     if (truck) truck.cargo = { ...truck.cargo, done: truck.cargo.done + 1, kgPerPallet: pallet.weightKg };
     if (pallet.crossDockFor) live.stats = { ...live.stats, crossDocked: live.stats.crossDocked + 1 };
-    adjustStock(live, pallet.sku, -1, data);
+    adjustStock(live, pallet.sku, -1, data, undefined, pallet.lot);
+    if (truck) addToManifest(live, truck, pallet);
   } else {
     const hold = live.seq % 6 === 0;
     const crossDock = !hold && live.site.type === "cross-dock";
@@ -712,13 +806,33 @@ function arrive(live: LiveSite, f: Forklift, data: SimData) {
     live.pallets = live.pallets.map((p) =>
       p.id === pallet.id ? { ...p, slotId: trip.slotId, status: hold ? "qc-hold" : crossDock ? "staged" : "received", receivedAt: live.t, crossDockFor: outbound?.id ?? null } : p,
     );
-    adjustStock(live, pallet.sku, 1, data);
+    adjustStock(live, pallet.sku, 1, data, undefined, pallet.lot);
     if (hold) alert(live, "warning", `${pallet.id} (${pallet.item}) put on QC hold at ${slot?.code}`);
   }
 }
 
+/** Map position from the forklift's tag: exact for UWB, a wandering fix for BLE, the last scan without a tag. */
+function showPosition(live: LiveSite, f: Forklift) {
+  if (f.tag === "uwb") f.shown = f.pos;
+  else if (f.tag === "ble") {
+    // A new fix every second, offset by a repeatable pseudo-random error.
+    const s = Math.floor(live.t) * 7919 + idNum(f.id) * 104729;
+    f.shown = [f.pos[0] + BLE_ERROR * Math.sin(s), f.pos[1] + BLE_ERROR * Math.cos(s * 1.3)];
+  } else f.shown = f.lastScan.pos;
+}
+
 function stepForklift(live: LiveSite, f: Forklift, dt: number, data: SimData) {
+  stepForkliftMotion(live, f, dt, data);
+  showPosition(live, f);
+}
+
+function stepForkliftMotion(live: LiveSite, f: Forklift, dt: number, data: SimData) {
   const working = f.status !== "idle" && f.status !== "charging";
+  if (working) {
+    const due = f.engineHours < f.serviceDueAt;
+    f.engineHours += dt / SIM_HOUR;
+    if (due && f.engineHours >= f.serviceDueAt) alert(live, "warning", `${f.id} is due for its ${SERVICE_INTERVAL} h service`);
+  }
   const before = f.battery;
   f.battery = Math.max(0, Math.min(100, f.battery + (f.status === "charging" ? 1.6 : working ? -0.35 : -0.02) * dt));
   const low = live.rules.battery.percent;
@@ -738,6 +852,7 @@ function stepForklift(live: LiveSite, f: Forklift, dt: number, data: SimData) {
     if (f.status === "to-charger") {
       f.status = "charging";
       f.task = `Charging at ${f.chargerId}`;
+      f.lastScan = { pos: f.pos, at: live.t };
     }
     return;
   }
@@ -799,7 +914,34 @@ export function tick(prev: LiveSite, dt: number, data: SimData): LiveSite {
   if (Math.floor(live.t / SAMPLE_EVERY) > Math.floor(prev.t / SAMPLE_EVERY)) {
     live.history = [...live.history, sample(live)].slice(-HISTORY_SAMPLES);
   }
+  if (Math.floor(live.t / FRAME_EVERY) > Math.floor(prev.t / FRAME_EVERY)) {
+    const cutoff = live.t - REPLAY_SPAN;
+    live.frames = [...live.frames.filter((fr) => fr.t > cutoff), snapshot(live)];
+  }
   return live;
+}
+
+function snapshot(live: LiveSite): Frame {
+  return {
+    t: live.t,
+    trucks: live.trucks.map(({ id, pos, heading, status, carrier, doorId }) => ({ id, pos, heading, status, carrier, doorId })),
+    forklifts: live.forklifts.map(({ id, shown, heading, status, carrying }) => ({ id, pos: shown, heading, status, carrying })),
+  };
+}
+
+/** Latest frame at or before `t` (binary search; frames are in time order). */
+export function frameAt(frames: Frame[], t: number): Frame | null {
+  let lo = 0;
+  let hi = frames.length - 1;
+  let found: Frame | null = null;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (frames[mid].t <= t) {
+      found = frames[mid];
+      lo = mid + 1;
+    } else hi = mid - 1;
+  }
+  return found;
 }
 
 const SAMPLE_EVERY = 20;
@@ -862,7 +1004,6 @@ export type ScanAction =
 export type ScanResult = { live: LiveSite; message: string } | { error: string };
 
 const idNum = (id: string) => Number(id.replace(/\D/g, "")) || 0;
-const zones: Record<string, string> = { PPE: "A", Lighting: "B", Furniture: "C", Packaging: "D" };
 
 /** A slot is taken when a pallet sits there or a forklift trip is headed to or from it. */
 export const slotTaken = (live: LiveSite, slotId: string) =>
@@ -882,9 +1023,23 @@ export const asnLine = (truck: Truck, data: SimData) =>
 export const orderLine = (truck: Truck, data: SimData) =>
   data.catalog.find((c) => c.sku === truck.sku) ?? data.catalog[(idNum(truck.id) + truck.cargo.done + 2) % data.catalog.length];
 
-/** Storage bin for a category, e.g. A-07-3: zone by category, aisle and level spread by `seed`. */
-export const binFor = (category: string, seed: string) =>
-  `${zones[category] ?? "E"}-${String(1 + (idNum(seed) % 12)).padStart(2, "0")}-${1 + (idNum(seed) % 4)}`;
+/** Zones that store a category; the first zone takes anything without one. */
+export const zonesFor = (l: SiteLayout, category: string): Zone[] => {
+  const own = l.zones.filter((z) => z.stores === category);
+  return own.length ? own : l.zones.slice(0, 1);
+};
+
+/** A bin in this zone's racks, e.g. A-07-3. Consecutive seeds walk every aisle, then every level, before repeating. */
+export function binIn(zone: Zone, seed: string) {
+  const n = idNum(seed);
+  return `${zone.code}-${String(1 + (n % zone.aisles)).padStart(2, "0")}-${1 + (Math.floor(n / zone.aisles) % zone.levels)}`;
+}
+
+/** Storage bin for a category: one of its zones, then a bin in that zone, both picked by `seed`. */
+export function binFor(l: SiteLayout, category: string, seed: string) {
+  const pool = zonesFor(l, category);
+  return pool.length ? binIn(pool[idNum(seed) % pool.length], seed) : "FLOOR";
+}
 
 export function applyScan(prev: LiveSite, action: ScanAction, data: SimData): ScanResult {
   const live: LiveSite = { ...prev, trucks: prev.trucks.map((t) => ({ ...t })) };
@@ -931,7 +1086,7 @@ export function applyScan(prev: LiveSite, action: ScanAction, data: SimData): Sc
       live.pallets = [...live.pallets, pallet];
       live.labels += 1;
       truck.cargo = { ...truck.cargo, done: truck.cargo.done + 1, kgPerPallet: pallet.weightKg };
-      adjustStock(live, item.sku, 1, data, action.qty);
+      adjustStock(live, item.sku, 1, data, action.qty, pallet.lot);
       return action.qcHold
         ? done(`${pallet.id} (${item.item}) put on QC hold at ${slot.code}`, "warning")
         : done(`${pallet.id} received from ${truck.id} into ${slot.code}`);
@@ -949,10 +1104,12 @@ export function applyScan(prev: LiveSite, action: ScanAction, data: SimData): Sc
       const slot = freeSlot(action.slotId);
       if (!slot) return { error: "That slot is no longer free" };
       const item = data.catalog.find((c) => c.sku === action.sku) ?? orderLine(truck, data);
-      if ((live.inventory.find((l) => l.sku === item.sku)?.qty ?? 0) < item.qtyPerPallet) return { error: `Not enough ${item.item} in storage` };
+      const line = live.inventory.find((l) => l.sku === item.sku);
+      if ((line?.qty ?? 0) < item.qtyPerPallet) return { error: `Not enough ${item.item} in storage` };
+      const lot = fefo(line!.lots)[0]?.lot ?? `L${2400 + n}-${String(100 + ((live.labels * 29) % 900))}`;
       live.pallets = [
         ...live.pallets,
-        { id: action.palletId, sku: item.sku, item: item.item, category: item.category, qty: item.qtyPerPallet, weightKg: item.kgPerPallet, lot: `L${2400 + n}-${String(100 + ((live.labels * 29) % 900))}`, status: "staged", slotId: slot.id, receivedAt: live.t, crossDockFor: truck.id },
+        { id: action.palletId, sku: item.sku, item: item.item, category: item.category, qty: item.qtyPerPallet, weightKg: item.kgPerPallet, lot, status: "staged", slotId: slot.id, receivedAt: live.t, crossDockFor: truck.id },
       ];
       live.labels += 1;
       return done(`${action.palletId} (${item.item}) staged at ${slot.code} for ${truck.id}`);
@@ -966,7 +1123,8 @@ export function applyScan(prev: LiveSite, action: ScanAction, data: SimData): Sc
       live.pallets = live.pallets.filter((p) => p.id !== pallet.id);
       truck.cargo = { ...truck.cargo, done: truck.cargo.done + 1, kgPerPallet: pallet.weightKg };
       if (pallet.crossDockFor) live.stats = { ...live.stats, crossDocked: live.stats.crossDocked + 1 };
-      adjustStock(live, pallet.sku, -1, data, -pallet.qty);
+      adjustStock(live, pallet.sku, -1, data, -pallet.qty, pallet.lot);
+      addToManifest(live, truck, pallet);
       return done(`${pallet.id} loaded onto ${truck.id}`);
     }
     case "count": {
@@ -1059,6 +1217,261 @@ export const setSharing = (live: LiveSite, truckId: string, on: boolean): LiveSi
   trucks: live.trucks.map((t) => (t.id === truckId ? { ...t, sharing: on } : t)),
 });
 
+// ---------- outbound waves, short picks and manifests ----------
+
+const waved = (live: LiveSite, appointmentId: string | null) => appointmentId !== null && live.waves.some((w) => w.appointmentIds.includes(appointmentId));
+
+/** What an outbound order asks for: whole pallets, SKUs spread by the appointment number. */
+export function orderLines(appt: Appointment, data: SimData) {
+  const pallets = new Map<string, number>();
+  for (let i = 0; i < appt.pallets; i++) {
+    const sku = data.catalog[(idNum(appt.id) + i) % data.catalog.length].sku;
+    pallets.set(sku, (pallets.get(sku) ?? 0) + 1);
+  }
+  return [...pallets].map(([sku, n]) => ({ sku, pallets: n }));
+}
+
+/** Orders that can go into a wave: outbound, not yet at the dock, not a transfer, not already waved. */
+export const releasable = (live: LiveSite) =>
+  live.appointments.filter((a) => a.direction === "outbound" && !a.transferId && (a.status === "booked" || a.status === "en-route") && !waved(live, a.id));
+
+/** Units each lot has promised to waves whose orders have not shipped yet. */
+function reserved(live: LiveSite, data: SimData) {
+  const open = new Set(live.appointments.filter((a) => a.status !== "done" && a.status !== "missed").map((a) => a.id));
+  const units = new Map<string, number>();
+  for (const l of live.waves.flatMap((w) => w.lines)) {
+    if (!l.lot || !open.has(l.appointmentId)) continue;
+    const per = data.catalog.find((c) => c.sku === l.sku)?.qtyPerPallet ?? 0;
+    units.set(l.lot, (units.get(l.lot) ?? 0) + (l.picked ?? l.pallets) * per);
+  }
+  return units;
+}
+
+/**
+ * Allocates the chosen orders FEFO-then-FIFO, lot by lot in whole pallets, and sorts the
+ * pick lines into walking order (zone, aisle, level). Stock nobody can supply becomes a no-stock line.
+ */
+// ponytail: reservations hold until the order ships, so a truck mid-load counts its pallets twice for a minute; fine for allocation, a ledger fixes it.
+export function releaseWave(prev: LiveSite, appointmentIds: string[], data: SimData): Result {
+  const open = new Set(releasable(prev).map((a) => a.id));
+  const appts = prev.appointments.filter((a) => appointmentIds.includes(a.id));
+  if (!appts.length) return { error: "Pick at least one order" };
+  const blocked = appts.find((a) => !open.has(a.id));
+  if (blocked) return { error: `${blocked.id} can no longer be waved` };
+
+  const live: LiveSite = { ...prev };
+  const held = reserved(live, data);
+  const lines: Omit<PickLine, "id">[] = [];
+  for (const appt of appts) {
+    for (const want of orderLines(appt, data)) {
+      const item = data.catalog.find((c) => c.sku === want.sku)!;
+      const stock = live.inventory.find((l) => l.sku === want.sku);
+      let need = want.pallets;
+      for (const lot of fefo(stock?.lots ?? [])) {
+        const take = Math.min(need, Math.floor((lot.qty - (held.get(lot.lot) ?? 0)) / item.qtyPerPallet));
+        if (take <= 0) continue;
+        lines.push({ appointmentId: appt.id, sku: item.sku, item: item.item, bin: binFor(live.site.layout, item.category, lot.lot), lot: lot.lot, expires: lot.expires, pallets: take, picked: null });
+        held.set(lot.lot, (held.get(lot.lot) ?? 0) + take * item.qtyPerPallet);
+        need -= take;
+        if (!need) break;
+      }
+      if (need) lines.push({ appointmentId: appt.id, sku: item.sku, item: item.item, bin: binFor(live.site.layout, item.category, item.sku), lot: null, expires: null, pallets: need, picked: null });
+    }
+  }
+  const id = `WAV-${Number(live.site.code.slice(3))}${String(live.waves.length + 1).padStart(2, "0")}`;
+  const sorted = lines.sort((a, b) => a.bin.localeCompare(b.bin)).map((l, i) => ({ ...l, id: `${id}-${i + 1}` }));
+  const wave: Wave = { id, createdAt: live.t, appointmentIds: appts.map((a) => a.id), lines: sorted };
+  live.waves = [wave, ...live.waves];
+  const noStock = sorted.filter((l) => !l.lot).length;
+  alert(live, noStock ? "warning" : "info", `${id} released: ${appts.length} orders, ${sorted.length} pick lines${noStock ? `, ${noStock} with no stock` : ""}`);
+  return { live };
+}
+
+/** Picker confirms a line. Fewer pallets than asked is a short pick: the order and its truck ship that much less. */
+export function confirmPick(prev: LiveSite, waveId: string, lineId: string, picked: number): Result {
+  const wave = prev.waves.find((w) => w.id === waveId);
+  const line = wave?.lines.find((l) => l.id === lineId);
+  if (!wave || !line) return { error: `${lineId} is not on ${waveId}` };
+  if (line.picked !== null) return { error: `${lineId} is already picked` };
+  if (!Number.isInteger(picked) || picked < 0 || picked > line.pallets) return { error: `Enter 0 to ${line.pallets} pallets` };
+  if (!line.lot && picked > 0) return { error: "No stock was allocated to this line; report it short" };
+
+  const live: LiveSite = { ...prev, trucks: prev.trucks.map((t) => ({ ...t })) };
+  const lines = wave.lines.map((l) => (l.id === lineId ? { ...l, picked } : l));
+  live.waves = live.waves.map((w) => (w.id === waveId ? { ...w, lines } : w));
+  const short = line.pallets - picked;
+  const appt = live.appointments.find((a) => a.id === line.appointmentId);
+  const truck = live.trucks.find((t) => t.appointmentId === line.appointmentId);
+  if (short && appt) {
+    patchAppointment(live, appt.id, { pallets: Math.max(0, appt.pallets - short) });
+    if (truck) truck.cargo = { ...truck.cargo, total: Math.max(truck.cargo.done, truck.cargo.total - short) };
+    alert(live, "warning", `Short pick on ${appt.id}: ${picked} of ${line.pallets} pallets of ${line.item}`);
+  }
+  if (truck && lines.filter((l) => l.appointmentId === line.appointmentId).every((l) => l.picked !== null)) stamp(live, truck.shipmentId, "Picked");
+  return { live };
+}
+
+/** The next pallet an outbound truck takes from storage: its wave's lines in order, else FEFO of the usual SKU. */
+function nextFromStorage(live: LiveSite, truck: Truck, data: SimData): { item: CatalogItem; lot: string | null } {
+  const plan = live.waves
+    .flatMap((w) => w.lines)
+    .filter((l) => l.appointmentId === truck.appointmentId && l.lot)
+    .flatMap((l) => Array<PickLine>(l.picked ?? l.pallets).fill(l));
+  const inFlight = live.forklifts.filter((f) => f.trip?.truckId === truck.id && f.carrying).length;
+  const step = plan[truck.cargo.done + inFlight] ?? plan[plan.length - 1];
+  if (step) return { item: data.catalog.find((c) => c.sku === step.sku)!, lot: step.lot };
+  const line = live.inventory.find((l) => l.sku === truck.sku) ?? [...live.inventory].sort((a, b) => b.qty - a.qty)[0];
+  return { item: data.catalog.find((c) => c.sku === line.sku) ?? data.catalog[0], lot: fefo(line.lots)[0]?.lot ?? null };
+}
+
+function addToManifest(live: LiveSite, truck: Truck, p: Pallet) {
+  const s = live.shipments[truck.shipmentId];
+  if (!s) return;
+  const line = { palletId: p.id, sku: p.sku, item: p.item, lot: p.lot, units: p.qty, kg: p.weightKg };
+  live.shipments = { ...live.shipments, [s.id]: { ...s, manifest: [...s.manifest, line] } };
+}
+
+// ---------- layout editor ----------
+
+export type LayoutEdit =
+  | { kind: "zone"; zone: Zone }
+  | { kind: "remove-zone"; id: string }
+  | { kind: "door"; door: DockDoor }
+  | { kind: "remove-door"; id: string }
+  | { kind: "slot"; slot: SiteLayout["slots"][number] }
+  | { kind: "remove-slot"; id: string };
+
+/** Rack bins in a zone: aisles × 2.7 m bays down its depth × levels. */
+export const zoneBins = (z: Zone) => z.aisles * Math.max(1, Math.floor(z.d / 2.7)) * z.levels;
+
+const DOOR_GAP = 4.5;
+const SLOT_GAP = 2.2;
+const overlaps = (a: Zone, b: Zone) => a.x < b.x + b.w && b.x < a.x + a.w && a.z < b.z + b.d && b.z < a.z + a.d;
+/** Trucks at, or heading to, a door, and bookings still to come. */
+const doorBusy = (live: LiveSite, id: string) =>
+  live.trucks.some((t) => t.doorId === id && t.status !== "departing") || live.appointments.some((a) => a.doorId === id && (a.status === "booked" || a.status === "en-route" || a.status === "on-site"));
+
+function checkZone(l: SiteLayout, z: Zone): string | null {
+  const { width: w, depth: d } = l.building;
+  if (!/^[A-Z]$/.test(z.code)) return "Zone code is one letter, A to Z";
+  if (!z.name.trim()) return "Give the zone a name";
+  if (![z.x, z.z, z.w, z.d].every(Number.isFinite) || z.w < 3 || z.d < 3) return "Zones are at least 3 × 3 m";
+  if (!Number.isInteger(z.aisles) || z.aisles < 1 || z.aisles > Math.floor(z.w / 1.5)) return `${z.w} m fits 1 to ${Math.floor(z.w / 1.5)} aisles`;
+  if (!Number.isInteger(z.levels) || z.levels < 1 || z.levels > 8) return "Racks have 1 to 8 levels";
+  if (z.x < -w / 2 + 0.5 || z.x + z.w > w / 2 - 0.5 || z.z < -d / 2 + 0.5) return "Zones stay inside the building walls";
+  if (z.z + z.d > d / 2 - DOCK_STRIP) return `Keep ${DOCK_STRIP} m inside the dock doors clear`;
+  const others = l.zones.filter((o) => o.id !== z.id);
+  if (others.some((o) => o.code === z.code)) return `Zone ${z.code} already exists`;
+  const hit = others.find((o) => overlaps(o, z));
+  return hit ? `Overlaps zone ${hit.code}` : null;
+}
+
+function checkDoor(live: LiveSite, door: DockDoor): string | null {
+  const l = live.site.layout;
+  const w = l.building.width;
+  if (!door.code.trim()) return "Give the door a code";
+  if (!Number.isFinite(door.x) || door.x < -w / 2 + 2 || door.x > w / 2 - 2) return "Doors sit along the front wall, 2 m from the corners";
+  const others = l.doors.filter((o) => o.id !== door.id);
+  if (others.some((o) => o.code === door.code)) return `${door.code} already exists`;
+  const near = others.find((o) => Math.abs(o.x - door.x) < DOOR_GAP);
+  if (near) return `Too close to ${near.code}; doors need ${DOOR_GAP} m`;
+  const before = l.doors.find((o) => o.id === door.id);
+  if (before && before.x !== door.x && live.trucks.some((t) => t.doorId === door.id && t.status !== "departing" && t.status !== "en-route"))
+    return `${before.code} has a truck at it; wait until it leaves`;
+  if (before && before.direction !== door.direction && doorBusy(live, door.id)) return `${before.code} has trucks or bookings; let them finish before flipping it`;
+  const all = [...others, door];
+  if (!all.some((o) => o.direction === "in") || !all.some((o) => o.direction === "out")) return "Keep at least one inbound and one outbound door";
+  return null;
+}
+
+function checkSlot(live: LiveSite, slot: SiteLayout["slots"][number]): string | null {
+  const l = live.site.layout;
+  const { width: w, depth: d } = l.building;
+  const [x, z] = slot.pos;
+  // Same rectangle as padBounds in heat.ts (kept here so this file stays import-free for the Node test).
+  const { x0, x1, z0, z1 } = { x0: -w / 2 - 42, x1: w / 2 + 26, z0: -d / 2 - 16, z1: l.roadZ - 5 };
+  if (!slot.code.trim()) return "Give the slot a code";
+  if (![x, z].every(Number.isFinite) || x < x0 + 1 || x > x1 - 1 || z < z0 + 1 || z > z1 - 1) return "Slots stay on the yard pad";
+  if (Math.abs(x) < w / 2 + 1.5 && Math.abs(z) < d / 2 + 1.5) return "Slots go outside the building";
+  if (Math.abs(z - laneZ(l)) < 1.6) return "Keep the forklift lane clear";
+  if (l.doors.some((door) => Math.abs(x - door.x) < 2.2 && z > d / 2 && z < d / 2 + 12)) return "Keep dock bays clear";
+  const others = l.slots.filter((o) => o.id !== slot.id);
+  if (others.some((o) => o.code === slot.code)) return `${slot.code} already exists`;
+  const near = others.find((o) => Math.hypot(o.pos[0] - x, o.pos[1] - z) < SLOT_GAP);
+  if (near) return `Too close to ${near.code}`;
+  const before = l.slots.find((o) => o.id === slot.id);
+  if (before && slotTaken(live, slot.id) && (before.pos[0] !== x || before.pos[1] !== z)) return `${before.code} has a pallet on it`;
+  return null;
+}
+
+/** One validated change to the active site's layout. The map, routes and bin codes all read the result. */
+export function editLayout(prev: LiveSite, edit: LayoutEdit): Result {
+  const l = prev.site.layout;
+  let next: SiteLayout;
+  let live: LiveSite = prev;
+  switch (edit.kind) {
+    case "zone": {
+      const error = checkZone(l, edit.zone);
+      if (error) return { error };
+      next = { ...l, zones: l.zones.some((z) => z.id === edit.zone.id) ? l.zones.map((z) => (z.id === edit.zone.id ? edit.zone : z)) : [...l.zones, edit.zone] };
+      break;
+    }
+    case "remove-zone": {
+      const zone = l.zones.find((z) => z.id === edit.id);
+      if (!zone) return { error: "That zone is gone" };
+      if (l.zones.length === 1) return { error: "Keep at least one zone; stock needs bins" };
+      if (prev.counts.some((c) => c.status !== "approved" && c.scope === "zone" && c.target === zone.code)) return { error: `Zone ${zone.code} has an open cycle count` };
+      next = { ...l, zones: l.zones.filter((z) => z.id !== edit.id) };
+      break;
+    }
+    case "door": {
+      const error = checkDoor(prev, edit.door);
+      if (error) return { error };
+      next = { ...l, doors: (l.doors.some((d) => d.id === edit.door.id) ? l.doors.map((d) => (d.id === edit.door.id ? edit.door : d)) : [...l.doors, edit.door]).sort((a, b) => a.x - b.x) };
+      break;
+    }
+    case "remove-door": {
+      const door = l.doors.find((d) => d.id === edit.id);
+      if (!door) return { error: "That door is gone" };
+      if (doorBusy(prev, door.id)) return { error: `${door.code} has trucks or bookings; let them finish first` };
+      const rest = l.doors.filter((d) => d.id !== edit.id);
+      if (!rest.some((d) => d.direction === "in") || !rest.some((d) => d.direction === "out")) return { error: "Keep at least one inbound and one outbound door" };
+      next = { ...l, doors: rest };
+      // Forklifts based at the removed door move to the first one left.
+      live = { ...prev, forklifts: prev.forklifts.map((f) => (f.doorId === door.id ? { ...f, doorId: rest[0].id } : f)) };
+      break;
+    }
+    case "slot": {
+      const error = checkSlot(prev, edit.slot);
+      if (error) return { error };
+      next = { ...l, slots: l.slots.some((s) => s.id === edit.slot.id) ? l.slots.map((s) => (s.id === edit.slot.id ? edit.slot : s)) : [...l.slots, edit.slot] };
+      break;
+    }
+    case "remove-slot": {
+      const slot = l.slots.find((s) => s.id === edit.id);
+      if (!slot) return { error: "That slot is gone" };
+      if (slotTaken(prev, slot.id)) return { error: `${slot.code} has a pallet on it` };
+      if (l.slots.length <= 2) return { error: "Keep at least two yard slots" };
+      next = { ...l, slots: l.slots.filter((s) => s.id !== edit.id) };
+      break;
+    }
+  }
+  return { live: { ...live, site: { ...live.site, layout: next } } };
+}
+
+// ---------- fleet (phase 4) ----------
+
+const patchForklift = (live: LiveSite, id: string, patch: (f: Forklift) => Partial<Forklift>): LiveSite => ({
+  ...live,
+  forklifts: live.forklifts.map((f) => (f.id === id ? { ...f, ...patch(f) } : f)),
+});
+
+/** Workshop sign-off: the next service falls one interval after the current reading. */
+export const logService = (live: LiveSite, id: string): LiveSite => patchForklift(live, id, (f) => ({ serviceDueAt: Math.round(f.engineHours) + SERVICE_INTERVAL }));
+
+/** Fit, swap or remove a positioning tag; the map moves to the new source on the next tick. */
+export const setTag = (live: LiveSite, id: string, tag: PositionTag): LiveSite => patchForklift(live, id, () => ({ tag }));
+
 // ---------- stock flows (phase 3) ----------
 
 type Result = { live: LiveSite } | { error: string };
@@ -1069,22 +1482,23 @@ export function abcClass(live: LiveSite, sku: string) {
   return rank < 2 ? "A" : rank < 4 ? "B" : "C";
 }
 
-export const zoneOf = (category: string) => zones[category] ?? "E";
+export const inZone = (l: SiteLayout, category: string, code: string) => zonesFor(l, category).some((z) => z.code === code);
 
 /** Opens a cycle count: three bins per item in scope, expected quantities frozen now. */
 export function createCount(prev: LiveSite, input: { scope: "zone" | "class"; target: string; blind: boolean }, data: SimData): Result {
   const items = prev.inventory.filter((line) =>
-    input.scope === "zone" ? zoneOf(line.category) === input.target : abcClass(prev, line.sku) === input.target,
+    input.scope === "zone" ? inZone(prev.site.layout, line.category, input.target) : abcClass(prev, line.sku) === input.target,
   );
   if (!items.length) return { error: `Nothing to count in ${input.scope} ${input.target}` };
   const live = { ...prev, seq: prev.seq + 1 };
   const k = live.seq;
   const n = Number(prev.site.code.slice(3));
-  const lines = items.flatMap((line, j) => {
+  const zone = input.scope === "zone" ? prev.site.layout.zones.find((z) => z.code === input.target) : undefined;
+  const all = items.flatMap((line, j) => {
     const first = Math.round(line.qty * 0.4);
     const second = Math.round(line.qty * 0.35);
     return [first, second, line.qty - first - second].map((expected, i) => ({
-      bin: `${zoneOf(line.category)}-${String(1 + ((k + j * 3 + i) % 12)).padStart(2, "0")}-${1 + ((k + i) % 4)}`,
+      bin: zone ? binIn(zone, String(k * 7 + j * 3 + i)) : binFor(prev.site.layout, line.category, String(k * 7 + j * 3 + i)),
       sku: line.sku,
       item: data.catalog.find((c) => c.sku === line.sku)?.item ?? line.item,
       expected,
@@ -1092,6 +1506,8 @@ export function createCount(prev: LiveSite, input: { scope: "zone" | "class"; ta
       countedAt: null,
     }));
   });
+  // Counters scan bins, so each bin appears once; a small zone just gets fewer lines.
+  const lines = all.filter((l, i) => all.findIndex((o) => o.bin === l.bin) === i);
   const task: CountTask = { id: `CC-${n}${100 + k}`, scope: input.scope, target: input.target, blind: input.blind, status: "open", lines, createdAt: prev.t, approvedAt: null };
   live.counts = [task, ...prev.counts].slice(0, 20);
   return { live };

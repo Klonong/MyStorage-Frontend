@@ -1,15 +1,18 @@
 "use client";
 
-import type { ReactNode } from "react";
-import { BatteryCharging, Building2, Crosshair, Forklift as ForkliftIcon, MapPinned, Navigation, Package, Truck as TruckIcon, X } from "lucide-react";
+import { useState, type ReactNode } from "react";
+import { BatteryCharging, Building2, Crosshair, Forklift as ForkliftIcon, MapPinned, Navigation, Package, ScrollText, Truck as TruckIcon, Wrench, X } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import Link from "next/link";
+import { toast } from "sonner";
 import { buttonVariants } from "@/components/ui/button";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import { useActiveSite, useWarehouse } from "@/hooks/useWarehouse";
 import type { Forklift, LiveSite, Pallet, Truck } from "@/interfaces/warehouse.interface";
-import { carried, doorOf, minutesLeft, palletLocation, truckLine, truckProgress } from "@/lib/describe";
+import { carried, doorOf, minutesLeft, palletLocation, positionSource, serviceLeft, tagNames, truckLine, truckProgress } from "@/lib/describe";
 import { clockAt, fmt, forkliftStatus, palletStatus, siteTypeLabel, truckStatus } from "@/lib/status";
+import { ManifestDialog } from "./manifest-dialog";
 import { batteryTone, Meter, Panel, StatusPill } from "./panel";
 
 function Header({ icon: Icon, eyebrow, title, subtitle, onLocate, onClose }: { icon: LucideIcon; eyebrow: string; title: string; subtitle: string; onLocate?: () => void; onClose?: () => void }) {
@@ -73,6 +76,7 @@ function TruckDetail({ live, truck, actions }: { live: LiveSite; truck: Truck; a
   const startedAt = useWarehouse((s) => s.startedAt);
   const appt = live.appointments.find((a) => a.id === truck.appointmentId);
   const eta = working ? `Done in ${minutesLeft(truck)} min` : `${clockAt(startedAt, live.t + minutesLeft(truck) * 60)} (${minutesLeft(truck)} min)`;
+  const [manifestOpen, setManifestOpen] = useState(false);
   return (
     <>
       <Header icon={TruckIcon} eyebrow={truck.carrier} title={truck.id} subtitle={`${truck.driver} · ${truck.plate}`} {...actions} />
@@ -99,7 +103,14 @@ function TruckDetail({ live, truck, actions }: { live: LiveSite; truck: Truck; a
           <MapPinned className="size-3.5" />
           Tracking page
         </Link>
+        {outbound && shipment && (
+          <button type="button" onClick={() => setManifestOpen(true)} className={cn(buttonVariants({ variant: "outline", size: "sm" }), "col-span-2 gap-1.5")}>
+            <ScrollText className="size-3.5" />
+            Load manifest · {shipment.manifest.length} pallets
+          </button>
+        )}
       </div>
+      {outbound && shipment && <ManifestDialog truck={truck} shipment={shipment} open={manifestOpen} onOpenChange={setManifestOpen} />}
     </>
   );
 }
@@ -107,6 +118,9 @@ function TruckDetail({ live, truck, actions }: { live: LiveSite; truck: Truck; a
 function ForkliftDetail({ live, forklift, actions }: { live: LiveSite; forklift: Forklift; actions: Actions }) {
   const status = forkliftStatus[forklift.status];
   const load = carried(live, forklift);
+  const logService = useWarehouse((s) => s.logService);
+  const setTag = useWarehouse((s) => s.setTag);
+  const left = serviceLeft(forklift);
   return (
     <>
       <Header icon={ForkliftIcon} eyebrow={`Forklift · ${live.site.code}`} title={forklift.id} subtitle={`${forklift.driver} · ${forklift.model}`} {...actions} />
@@ -116,15 +130,53 @@ function ForkliftDetail({ live, forklift, actions }: { live: LiveSite; forklift:
         <Meter value={forklift.battery / 100} tone={batteryTone(forklift.battery)} className="flex-1" />
         <span className="w-12 text-right text-xs font-medium tabular-nums">{Math.round(forklift.battery)}%</span>
       </div>
+      {left <= 0 && (
+        <div className="flex items-center gap-2 rounded-xl bg-amber-50 p-2.5 text-xs text-amber-800">
+          <Wrench className="size-4 shrink-0" />
+          <span className="flex-1">Service due, {Math.floor(-left)} h over</span>
+          <button
+            type="button"
+            onClick={() => {
+              const err = logService(forklift.id);
+              if (err) toast.error(err);
+              else toast.success(`${forklift.id} service logged`);
+            }}
+            className={cn(buttonVariants({ variant: "outline", size: "sm" }), "h-7 bg-white")}
+          >
+            Log service
+          </button>
+        </div>
+      )}
       <Rows
         rows={[
           ["Carrying", load ? `${load.id} · ${load.item}` : "Empty"],
           ["Moves today", fmt(forklift.movesToday)],
           ["Speed", `${(forklift.speed * 3.6).toFixed(1)} km/h`],
+          ["Engine hours", `${fmt(Math.floor(forklift.engineHours))} h`],
+          ["Next service", left > 0 ? `In ${Math.ceil(left)} h, at ${fmt(forklift.serviceDueAt)} h` : "Due now"],
+          ["Position", positionSource(live, forklift)],
           ["Charger", forklift.chargerId],
           ["Site", live.site.name],
         ]}
       />
+      <div className="flex items-center justify-between gap-3">
+        <span className="text-xs text-muted-foreground">Positioning</span>
+        <Select items={tagNames} value={forklift.tag ?? "none"} onValueChange={(v) => {
+            const err = v && setTag(forklift.id, v === "none" ? null : (v as "uwb" | "ble"));
+            if (err) toast.error(err);
+          }}>
+          <SelectTrigger size="sm" className="w-36 bg-white" aria-label="Positioning tag">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {Object.entries(tagNames).map(([v, text]) => (
+              <SelectItem key={v} value={v}>
+                {text}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
     </>
   );
 }

@@ -17,6 +17,7 @@ import {
 import { Kbd } from "@/components/ui/kbd";
 import { useActiveSite, useWarehouse } from "@/hooks/useWarehouse";
 import type { LiveSite } from "@/interfaces/warehouse.interface";
+import { initials, roles } from "@/lib/access";
 import { clockAt } from "@/lib/status";
 import { cn } from "@/lib/utils";
 import { AlertRulesDialog } from "./alert-rules";
@@ -138,7 +139,43 @@ const tabs = [
   { href: "/stock", label: "Stock" },
   { href: "/reports", label: "Reports" },
   { href: "/integrations", label: "Integrations" },
+  { href: "/layout", label: "Layout" },
+  { href: "/admin", label: "Admin" },
 ];
+
+/** Who is signed in; switching users is a demo stand-in for real sign-in. */
+function UserMenu() {
+  const users = useWarehouse((s) => s.users);
+  const userId = useWarehouse((s) => s.userId);
+  const setUser = useWarehouse((s) => s.setUser);
+  const me = users.find((u) => u.id === userId) ?? users[0];
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger className="flex items-center gap-2 rounded-xl pl-1 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring" aria-label={`Signed in as ${me.name}, switch user`}>
+        <Avatar className="size-8">
+          <AvatarFallback className="bg-slate-200 text-xs font-semibold">{initials(me.name)}</AvatarFallback>
+        </Avatar>
+        <span className="hidden leading-tight xl:block">
+          <span className="block text-sm font-semibold">{me.name}</span>
+          <span className="block text-xs text-muted-foreground">{roles[me.role].name}</span>
+        </span>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-64">
+        <DropdownMenuGroup>
+          <DropdownMenuLabel>Sign in as (demo)</DropdownMenuLabel>
+          {users.map((u) => (
+            <DropdownMenuItem key={u.id} onClick={() => setUser(u.id)} className="gap-2 py-1.5">
+              <span className="flex-1 leading-tight">
+                <span className={cn("block text-sm", u.id === me.id && "font-semibold")}>{u.name}</span>
+                <span className="block text-xs text-muted-foreground">{roles[u.role].name}</span>
+              </span>
+            </DropdownMenuItem>
+          ))}
+        </DropdownMenuGroup>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
 
 export function TopBar({ onSearch }: { onSearch: () => void }) {
   const pathname = usePathname();
@@ -189,15 +226,7 @@ export function TopBar({ onSearch }: { onSearch: () => void }) {
           <ScanLine className="size-4" />
         </Link>
         <AlertsMenu onRules={() => setRulesOpen(true)} />
-        <div className="hidden items-center gap-2 pl-1 xl:flex">
-          <Avatar className="size-8">
-            <AvatarFallback className="bg-slate-200 text-xs font-semibold">AC</AvatarFallback>
-          </Avatar>
-          <span className="leading-tight">
-            <span className="block text-sm font-semibold">Alex Chen</span>
-            <span className="block text-xs text-muted-foreground">Operations Manager</span>
-          </span>
-        </div>
+        <UserMenu />
       </div>
       <AlertRulesDialog open={rulesOpen} onOpenChange={setRulesOpen} />
     </Panel>

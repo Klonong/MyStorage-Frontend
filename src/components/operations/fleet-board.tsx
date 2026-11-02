@@ -4,7 +4,7 @@ import { ChevronRight } from "lucide-react";
 import type { ReactNode } from "react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useActiveSite, useWarehouse } from "@/hooks/useWarehouse";
-import { doorOf, minutesLeft, truckProgress } from "@/lib/describe";
+import { doorOf, minutesLeft, serviceLeft, truckProgress } from "@/lib/describe";
 import { forkliftStatus, truckStatus } from "@/lib/status";
 import { batteryTone, Meter, Panel, StatusPill } from "./panel";
 
@@ -80,7 +80,7 @@ export function FleetBoard() {
                 key={f.id}
                 title={f.id}
                 sub={f.chargerId}
-                middle={f.task}
+                middle={serviceLeft(f) <= 0 ? <span className="text-amber-700">Service due · {f.task}</span> : f.task}
                 status={<StatusPill tone={forkliftStatus[f.status].tone}>{forkliftStatus[f.status].label}</StatusPill>}
                 tail={
                   <span className="flex flex-col items-end gap-1">

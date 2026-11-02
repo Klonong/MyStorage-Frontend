@@ -57,6 +57,19 @@ export function palletLocation(live: LiveSite, pallet: Pallet) {
 
 export const carried = (live: LiveSite, f: Forklift) => live.pallets.find((p) => p.id === f.carrying);
 
+/** Engine hours left to the next service; zero or less means it is due. */
+export const serviceLeft = (f: Forklift) => f.serviceDueAt - f.engineHours;
+
+export const tagNames = { uwb: "UWB tag", ble: "BLE beacon", none: "No tag" } as const;
+
+/** Where the map position comes from, with its accuracy or age. */
+export function positionSource(live: LiveSite, f: Forklift) {
+  if (f.tag === "uwb") return "UWB tag, about 0.3 m";
+  if (f.tag === "ble") return "BLE beacon, about 3 m";
+  const m = Math.floor((live.t - f.lastScan.at) / 60);
+  return `Last scan, ${m < 1 ? "just now" : `${m} min ago`}`;
+}
+
 export type StepState = "done" | "active" | "todo";
 
 /**

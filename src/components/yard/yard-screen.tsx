@@ -269,7 +269,13 @@ function GatePanel() {
         </h2>
         <label className="flex items-center gap-2 text-xs text-muted-foreground">
           Auto check-in
-          <Switch checked={live.autoCheckIn} onCheckedChange={setAutoCheckIn} />
+          <Switch
+            checked={live.autoCheckIn}
+            onCheckedChange={(on) => {
+              const err = setAutoCheckIn(on);
+              if (err) toast.error(err);
+            }}
+          />
         </label>
       </div>
       {waiting.length === 0 && (

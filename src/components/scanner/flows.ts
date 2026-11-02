@@ -241,20 +241,20 @@ export const flows: Record<FlowId, FlowDef> = {
         icon: Boxes,
         prompt: (live, v) => {
           const p = live.pallets.find((x) => x.id === v.pallet);
-          return p ? `Take it to bin ${binFor(p.category, p.id)}` : "Take it to its bin";
+          return p ? `Take it to bin ${binFor(live.site.layout, p.category, p.id)}` : "Take it to its bin";
         },
         hint: () => "Scan the bin label on the rack",
         options: (live, v) => {
           const p = live.pallets.find((x) => x.id === v.pallet);
           if (!p) return [];
-          const bin = binFor(p.category, p.id);
+          const bin = binFor(live.site.layout, p.category, p.id);
           return [{ code: bin, title: `Bin ${bin}`, note: `Suggested · zone ${bin[0]} holds ${p.category}` }];
         },
         resolve: (live, code, v) => {
           const p = live.pallets.find((x) => x.id === v.pallet);
           if (!p?.slotId) return { error: `${v.pallet} has left the yard. Start over.` };
           if (!/^[A-E]-\d{2}-[1-4]$/.test(code)) return { error: `${code} is not a bin label` };
-          const zone = binFor(p.category, p.id)[0];
+          const zone = binFor(live.site.layout, p.category, p.id)[0];
           if (code[0] !== zone) return { error: `Wrong zone: ${p.category} goes to zone ${zone}` };
           return { value: code };
         },
@@ -262,7 +262,7 @@ export const flows: Record<FlowId, FlowDef> = {
     ],
     review: (live, v) => {
       const p = live.pallets.find((x) => x.id === v.pallet);
-      const suggested = p && binFor(p.category, p.id);
+      const suggested = p && binFor(live.site.layout, p.category, p.id);
       return [
         ["Pallet", v.pallet],
         ["Item", p ? `${p.item} · ${p.qty} units` : "Not found"],
@@ -308,21 +308,21 @@ export const flows: Record<FlowId, FlowDef> = {
           const t = truckOf(live, v.order);
           if (!t) return "Order closed";
           const item = orderLine(t, simData);
-          return `Pick ${item.qtyPerPallet} × ${item.item} from bin ${binFor(item.category, t.shipmentId)}`;
+          return `Pick ${item.qtyPerPallet} × ${item.item} from bin ${binFor(live.site.layout, item.category, t.shipmentId)}`;
         },
         hint: () => "Scan the bin label on the rack",
         options: (live, v) => {
           const t = truckOf(live, v.order);
           if (!t) return [];
           const item = orderLine(t, simData);
-          const bin = binFor(item.category, t.shipmentId);
+          const bin = binFor(live.site.layout, item.category, t.shipmentId);
           return [{ code: bin, title: `Bin ${bin}`, note: `${item.item} · ${item.sku}` }];
         },
         resolve: (live, code, v) => {
           const t = truckOf(live, v.order);
           if (!t) return { error: "This order is closed. Start over." };
           const item = orderLine(t, simData);
-          const bin = binFor(item.category, t.shipmentId);
+          const bin = binFor(live.site.layout, item.category, t.shipmentId);
           return code === bin ? { value: code, extra: { sku: item.sku } } : { error: `Wrong bin. Go to ${bin}.` };
         },
       },

@@ -6,6 +6,7 @@ import { toast } from "sonner";
 import { useActiveSite, useWarehouse } from "@/hooks/useWarehouse";
 import { DetailPanel } from "./detail-panel";
 import { FleetBoard } from "./fleet-board";
+import { InsightsBar } from "./insights-bar";
 import { KpiStrip } from "./kpi-strip";
 import { MapControls } from "./map-controls";
 import { SearchCommand } from "./search-command";
@@ -69,7 +70,8 @@ export function OperationsConsole() {
               <div className={hasSelection ? "min-h-0 shrink" : "hidden min-h-0 shrink sm:block"}>
                 <DetailPanel />
               </div>
-              <div className="hidden md:block">
+              <div className="hidden space-y-3 md:block">
+                <InsightsBar />
                 <FleetBoard />
               </div>
             </div>

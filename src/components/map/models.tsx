@@ -4,9 +4,10 @@ import { Edges, Line, RoundedBox, useCursor } from "@react-three/drei";
 import { useFrame, type ThreeEvent } from "@react-three/fiber";
 import { useRef, useState } from "react";
 import type { Group } from "three";
+import { TICK_SECONDS } from "@/components/base/live-feed";
 import { useWarehouse } from "@/hooks/useWarehouse";
-import type { Pallet } from "@/interfaces/warehouse.interface";
-import { plannedRoute } from "@/lib/simulator";
+import type { Pallet, Vec2 } from "@/interfaces/warehouse.interface";
+import { frameAt, plannedRoute } from "@/lib/simulator";
 import { forkliftStatus, palletStatus, truckStatus, type Tone } from "@/lib/status";
 import { Block, Label, palette, Pin, type V3 } from "./primitives";
 import { carrierDecal } from "./textures";
@@ -38,20 +39,55 @@ function useHover() {
   };
 }
 
-/** Eases a model toward its simulated position each frame, so 4 Hz updates look continuous. */
+type State = ReturnType<typeof useWarehouse.getState>;
+
+/** Selecting something at another site makes that site the active one first, so the panels follow. */
+function pickAt(siteId: string, selection: NonNullable<State["selection"]>) {
+  const s = useWarehouse.getState();
+  if (s.activeSiteId !== siteId) s.setActiveSite(siteId);
+  useWarehouse.getState().select(selection);
+}
+
+/** The replay frame on screen, or null when the map is live. */
+export const replayFrame = (s: State, siteId: string) => (s.replay ? frameAt(s.sites[siteId].frames, s.replay.at) : null);
+const truckOn = (s: State, siteId: string, id: string) => (replayFrame(s, siteId) ?? s.sites[siteId]).trucks.find((t) => t.id === id);
+const forkliftOn = (s: State, siteId: string, id: string) => {
+  const frame = replayFrame(s, siteId);
+  return frame ? frame.forklifts.find((f) => f.id === id) : s.sites[siteId].forklifts.find((f) => f.id === id);
+};
+/** Live forklifts sit where their tag (or last scan) puts them; frames already store that position. */
+const forkliftPose = (s: State, siteId: string, id: string) => {
+  const frame = replayFrame(s, siteId);
+  if (frame) return frame.forklifts.find((f) => f.id === id);
+  const f = s.sites[siteId].forklifts.find((x) => x.id === id);
+  return f && { pos: f.shown, heading: f.heading };
+};
+
+/** Glides a model at constant speed between simulated poses, so 4 Hz updates look continuous. */
 function useFollow(siteId: string, kind: "truck" | "forklift", id: string) {
   const ref = useRef<Group>(null);
-  const placed = useRef(false);
-  useFrame((_, delta) => {
+  // The glide in progress: from where the model was to the latest simulated pose, over `span` seconds.
+  const glide = useRef<{ from: Vec2; to: Vec2; h0: number; h1: number; at: number; span: number } | null>(null);
+  useFrame(({ clock }) => {
     const g = ref.current;
-    const live = useWarehouse.getState().sites[siteId];
-    const o = kind === "truck" ? live.trucks.find((t) => t.id === id) : live.forklifts.find((f) => f.id === id);
+    const s = useWarehouse.getState();
+    const o = kind === "truck" ? truckOn(s, siteId, id) : forkliftPose(s, siteId, id);
     if (!g || !o) return;
-    const k = placed.current ? 1 - Math.exp(-10 * delta) : 1;
-    placed.current = true;
-    g.position.x += (o.pos[0] - g.position.x) * k;
-    g.position.z += (o.pos[1] - g.position.z) * k;
-    g.rotation.y += Math.atan2(Math.sin(o.heading - g.rotation.y), Math.cos(o.heading - g.rotation.y)) * k;
+    const now = clock.elapsedTime;
+    const c = glide.current;
+    if (!c || o.pos[0] !== c.to[0] || o.pos[1] !== c.to[1] || o.heading !== c.h1) {
+      // A new sample (or a jump, like a replay scrub or a fresh spawn, which snaps instead of sliding across the map).
+      const snap = !c || Math.hypot(o.pos[0] - g.position.x, o.pos[1] - g.position.z) > 25;
+      // Glide for as long as the last gap between samples, since timers drift around the nominal tick.
+      const span = c ? Math.min(TICK_SECONDS * 1.6, Math.max(TICK_SECONDS * 0.6, now - c.at)) : TICK_SECONDS;
+      glide.current = { from: snap ? o.pos : [g.position.x, g.position.z], to: o.pos, h0: snap ? o.heading : g.rotation.y, h1: o.heading, at: now, span };
+    }
+    const { from, to, h0, h1, at, span } = glide.current!;
+    // Constant speed between samples: no lurch-then-slow every update.
+    const a = Math.min(1, (now - at) / span);
+    g.position.x = from[0] + (to[0] - from[0]) * a;
+    g.position.z = from[1] + (to[1] - from[1]) * a;
+    g.rotation.y = h0 + Math.atan2(Math.sin(h1 - h0), Math.cos(h1 - h0)) * a;
   });
   return ref;
 }
@@ -132,7 +168,6 @@ export function PalletModel({ siteId, id }: { siteId: string; id: string }) {
   const pallet = useWarehouse((s) => s.sites[siteId].pallets.find((p) => p.id === id));
   const slot = useWarehouse((s) => s.sites[siteId].site.layout.slots.find((sl) => sl.id === pallet?.slotId));
   const selected = useWarehouse((s) => s.selection?.kind === "pallet" && s.selection.id === id);
-  const select = useWarehouse((s) => s.select);
   const { hovered, handlers } = useHover();
   if (!pallet || !slot) return null;
   const status = palletStatus[pallet.status];
@@ -141,7 +176,7 @@ export function PalletModel({ siteId, id }: { siteId: string; id: string }) {
       position={[slot.pos[0], 0, slot.pos[1]]}
       onClick={(e) => {
         e.stopPropagation();
-        select({ kind: "pallet", id });
+        pickAt(siteId, { kind: "pallet", id });
       }}
       {...handlers}
     >
@@ -175,6 +210,7 @@ function Wheel({ x, z }: { x: number; z: number }) {
 function TruckBody({ carrier }: { carrier: string }) {
   const { cab, accent } = livery[carrier] ?? livery["WareTrack Freight"];
   const decal = carrierDecal(carrier, accent);
+  const night = useWarehouse((s) => s.night);
   return (
     <group>
       <Block size={[2.1, 0.4, 9.8]} position={[0, 0.78, 0]} color="#334155" />
@@ -199,7 +235,7 @@ function TruckBody({ carrier }: { carrier: string }) {
         <group key={s}>
           <Block size={[0.06, 0.8, 1.05]} position={[s * 1.23, 2.45, 3.85]} color="#1e293b" cast={false} roughness={0.15} />
           <Block size={[0.12, 0.42, 0.1]} position={[s * 1.42, 2.35, 4.45]} color="#1f2937" cast={false} />
-          <Block size={[0.4, 0.16, 0.04]} position={[s * 0.82, 1.15, 4.79]} color="#fff8e1" cast={false} />
+          <Block size={[0.4, 0.16, 0.04]} position={[s * 0.82, 1.15, 4.79]} color="#fff8e1" cast={false} glow={night ? "#fff1b8" : undefined} />
         </group>
       ))}
       <Block size={[1.1, 0.38, 0.04]} position={[0, 1.25, 4.79]} color="#475569" cast={false} />
@@ -212,10 +248,9 @@ function TruckBody({ carrier }: { carrier: string }) {
 
 export function TruckModel({ siteId, id }: { siteId: string; id: string }) {
   const ref = useFollow(siteId, "truck", id);
-  const status = useWarehouse((s) => s.sites[siteId].trucks.find((t) => t.id === id)?.status);
-  const carrier = useWarehouse((s) => s.sites[siteId].trucks.find((t) => t.id === id)?.carrier ?? "");
+  const status = useWarehouse((s) => truckOn(s, siteId, id)?.status);
+  const carrier = useWarehouse((s) => truckOn(s, siteId, id)?.carrier ?? "");
   const selected = useWarehouse((s) => s.selection?.kind === "truck" && s.selection.id === id);
-  const select = useWarehouse((s) => s.select);
   const { hovered, handlers } = useHover();
   const meta = status ? truckStatus[status] : null;
   return (
@@ -223,7 +258,7 @@ export function TruckModel({ siteId, id }: { siteId: string; id: string }) {
       ref={ref}
       onClick={(e) => {
         e.stopPropagation();
-        select({ kind: "truck", id });
+        pickAt(siteId, { kind: "truck", id });
       }}
       {...handlers}
     >
@@ -258,14 +293,12 @@ export function RouteLine({ siteId, id }: { siteId: string; id: string }) {
 
 export function ForkliftModel({ siteId, id }: { siteId: string; id: string }) {
   const ref = useFollow(siteId, "forklift", id);
-  const status = useWarehouse((s) => s.sites[siteId].forklifts.find((f) => f.id === id)?.status ?? "idle");
+  const status = useWarehouse((s) => forkliftOn(s, siteId, id)?.status ?? "idle");
   const load = useWarehouse((s) => {
-    const live = s.sites[siteId];
-    const carrying = live.forklifts.find((f) => f.id === id)?.carrying;
-    return carrying ? live.pallets.find((p) => p.id === carrying) : undefined;
+    const carrying = forkliftOn(s, siteId, id)?.carrying;
+    return carrying ? s.sites[siteId].pallets.find((p) => p.id === carrying) : undefined;
   });
   const selected = useWarehouse((s) => (s.selection?.kind === "forklift" && s.selection.id === id) || (s.selection?.kind === "pallet" && s.selection.id === load?.id));
-  const select = useWarehouse((s) => s.select);
   const { hovered, handlers } = useHover();
   const meta = forkliftStatus[status];
   const lift = load ? 0.35 : 0;
@@ -274,7 +307,7 @@ export function ForkliftModel({ siteId, id }: { siteId: string; id: string }) {
       ref={ref}
       onClick={(e) => {
         e.stopPropagation();
-        select({ kind: "forklift", id });
+        pickAt(siteId, { kind: "forklift", id });
       }}
       {...handlers}
     >

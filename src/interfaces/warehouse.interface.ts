@@ -10,8 +10,26 @@ export interface DockDoor {
   x: number;
 }
 
+/** A storage zone inside the building: rack rows (aisles) of `levels` beams, holding one item category. */
+export interface Zone {
+  id: string;
+  /** One letter; bin codes start with it (A-07-3). */
+  code: string;
+  name: string;
+  /** Item category stored here; putaway and picking send that category to this zone's bins. */
+  stores: string;
+  /** Floor rectangle in site metres: min corner, then size. */
+  x: number;
+  z: number;
+  w: number;
+  d: number;
+  aisles: number;
+  levels: number;
+}
+
 export interface SiteLayout {
   building: { width: number; depth: number; height: number };
+  zones: Zone[];
   doors: DockDoor[];
   /** Staging slots on the apron left of the building. */
   slots: { id: string; code: string; pos: Vec2 }[];
@@ -121,6 +139,23 @@ export interface Forklift {
   /** Trip in progress: which truck, and the slot it picks from or drops to. */
   trip: { truckId: string; slotId: string; next: "pick" | "drop" } | null;
   waitUntil: number;
+  /** Telematics: running hours (demo hours) and the reading the next service is due at. */
+  engineHours: number;
+  serviceDueAt: number;
+  /** Indoor positioning tag; without one the map shows the last scan. */
+  tag: PositionTag;
+  lastScan: { pos: Vec2; at: number };
+  /** Where the map draws it: the tag fix, or the last scan for untagged trucks. */
+  shown: Vec2;
+}
+
+export type PositionTag = "uwb" | "ble" | null;
+
+/** One replay snapshot of moving objects, at the positions the map showed. */
+export interface Frame {
+  t: number;
+  trucks: Pick<Truck, "id" | "pos" | "heading" | "status" | "carrier" | "doorId">[];
+  forklifts: (Pick<Forklift, "id" | "heading" | "status" | "carrying"> & { pos: Vec2 })[];
 }
 
 export type PalletStatus = "received" | "staged" | "qc-hold" | "loading";
@@ -152,14 +187,58 @@ export interface Shipment {
   party: string;
   place: string;
   steps: ShipmentStep[];
+  /** Pallets loaded so far; the load manifest the truck is dispatched with. */
+  manifest: ManifestLine[];
 }
 
 export interface InventoryLine {
   sku: string;
   item: string;
   category: string;
+  /** Units on hand; always the sum of `lots`. */
   qty: number;
   lowStock: number;
+  lots: Lot[];
+}
+
+export interface Lot {
+  lot: string;
+  /** ISO date, or null for items that do not expire. */
+  expires: string | null;
+  receivedAt: number;
+  qty: number;
+}
+
+/** One pick: whole pallets of one lot from one storage bin. */
+export interface PickLine {
+  id: string;
+  appointmentId: string;
+  sku: string;
+  item: string;
+  bin: string;
+  /** Null when allocation found no stock: the line can only be short-picked. */
+  lot: string | null;
+  expires: string | null;
+  pallets: number;
+  /** Pallets the picker confirmed; null until picked. Fewer than `pallets` is a short pick. */
+  picked: number | null;
+}
+
+export interface Wave {
+  id: string;
+  createdAt: number;
+  appointmentIds: string[];
+  /** In walking order. */
+  lines: PickLine[];
+}
+
+export interface ManifestLine {
+  palletId: string;
+  sku: string;
+  item: string;
+  lot: string;
+  units: number;
+  kg: number;
 }
 
 export interface SiteAlert {
@@ -267,8 +346,11 @@ export interface LiveSite {
   };
   counts: CountTask[];
   returns: ReturnCase[];
+  waves: Wave[];
   visits: Visit[];
   history: Sample[];
+  /** Replay snapshots, oldest first, covering the last 24 demo hours. */
+  frames: Frame[];
   appointments: Appointment[];
   rules: AlertRules;
   /** When on, the guard checks trucks in on their own after a short wait. */

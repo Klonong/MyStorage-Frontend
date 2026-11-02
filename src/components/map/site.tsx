@@ -4,7 +4,8 @@
 // modelled on the reference video (white ribbed walls, blue sawtooth roof, open docks).
 import { useLayoutEffect, useMemo, useRef } from "react";
 import { DoubleSide, Object3D, Shape, type InstancedMesh } from "three";
-import type { SiteLayout, SiteType } from "@/interfaces/warehouse.interface";
+import type { SiteLayout, SiteType, Zone } from "@/interfaces/warehouse.interface";
+import { padBounds } from "@/lib/heat";
 import { Block, Label, palette, type V3 } from "./primitives";
 import { brandSign, ribs } from "./textures";
 
@@ -72,12 +73,17 @@ function GableRoof({ width, depth, height }: { width: number; depth: number; hei
   );
 }
 
-/** A ribbed-wall hall with navy corner posts and a sawtooth roof. */
-function Hall({ width, depth, height, position = [0, 0, 0] }: { width: number; depth: number; height: number; position?: V3 }) {
+/** A ribbed-wall hall with navy corner posts and a sawtooth roof. `open` cuts it down to knee walls so the floor shows. */
+function Hall({ width, depth, height: full, position = [0, 0, 0], open = false }: { width: number; depth: number; height: number; position?: V3; open?: boolean }) {
+  const height = open ? 1.4 : full;
   return (
     <group position={position}>
-      {/* Solid core for shadows; the ribbed planes sit just outside it. */}
-      <Block size={[width - 0.05, height, depth - 0.05]} position={[0, height / 2, 0]} color={palette.wall} />
+      {/* Solid core for shadows; the ribbed planes sit just outside it. Open halls show a floor instead. */}
+      {open ? (
+        <Flat x={0} z={0} w={width - 0.1} d={depth - 0.1} color={palette.interior} y={0.52} />
+      ) : (
+        <Block size={[width - 0.05, height, depth - 0.05]} position={[0, height / 2, 0]} color={palette.wall} />
+      )}
       <RibbedWall width={width} height={height} position={[0, height / 2, depth / 2]} rotationY={0} />
       <RibbedWall width={width} height={height} position={[0, height / 2, -depth / 2]} rotationY={Math.PI} />
       <RibbedWall width={depth} height={height} position={[-width / 2, height / 2, 0]} rotationY={-Math.PI / 2} />
@@ -91,7 +97,46 @@ function Hall({ width, depth, height, position = [0, 0, 0] }: { width: number; d
       ].map(([sx, sz]) => (
         <Block key={`${sx}${sz}`} size={[0.55, height + 0.2, 0.55]} position={[(sx * width) / 2, (height + 0.2) / 2, (sz * depth) / 2]} color={palette.navy} />
       ))}
-      <GableRoof width={width} depth={depth} height={height} />
+      {!open && <GableRoof width={width} depth={depth} height={height} />}
+    </group>
+  );
+}
+
+const zoneTints = ["#dbeafe", "#dcfce7", "#fef3c7", "#fce7f3", "#e0e7ff", "#ccfbf1"];
+
+/** One rack row running front to back: uprights every bay, a beam pair per level, cartons on most cells. */
+function RackRow({ x, z, length, levels }: { x: number; z: number; length: number; levels: number }) {
+  const bays = Math.max(1, Math.floor(length / 2.7));
+  const bay = length / bays;
+  return (
+    <group position={[x, 0.5, z]}>
+      {Array.from({ length: bays + 1 }, (_, i) => (
+        <Block key={`u${i}`} size={[1.1, levels * 1.25 + 0.3, 0.1]} position={[0, (levels * 1.25 + 0.3) / 2, -length / 2 + i * bay]} color="#ea7a1f" cast={false} />
+      ))}
+      {Array.from({ length: levels }, (_, j) =>
+        Array.from({ length: bays }, (_, i) =>
+          (i * 3 + j * 5 + Math.round(x)) % 4 === 0 ? null : (
+            <Block key={`c${i}-${j}`} size={[0.95, 0.85, bay * 0.8]} position={[0, j * 1.25 + 0.5, -length / 2 + (i + 0.5) * bay]} color={(i + j) % 3 ? palette.cardboard : "#c99858"} cast={false} />
+          ),
+        ),
+      )}
+    </group>
+  );
+}
+
+/** Storage zones from the layout: tinted floor, code label and a rack row per aisle. */
+function Zones({ zones }: { zones: Zone[] }) {
+  return (
+    <group>
+      {zones.map((zone, k) => (
+        <group key={zone.id}>
+          <Flat x={zone.x + zone.w / 2} z={zone.z + zone.d / 2} w={zone.w} d={zone.d} color={zoneTints[k % zoneTints.length]} y={0.54} />
+          {Array.from({ length: zone.aisles }, (_, i) => (
+            <RackRow key={i} x={zone.x + (i + 0.5) * (zone.w / zone.aisles)} z={zone.z + zone.d / 2} length={zone.d - 0.6} levels={zone.levels} />
+          ))}
+          <Label position={[zone.x + zone.w / 2, zone.levels * 1.25 + 2.2, zone.z + zone.d / 2]} text={`Zone ${zone.code} · ${zone.name}`} />
+        </group>
+      ))}
     </group>
   );
 }
@@ -119,21 +164,26 @@ function DockOpening({ code, x, z, busy }: { code: string; x: number; z: number;
   );
 }
 
-export function Warehouse({ layout, type, busyDoors }: { layout: SiteLayout; type: SiteType; busyDoors: string[] }) {
+export function Warehouse({ layout, type, busyDoors, interior = false }: { layout: SiteLayout; type: SiteType; busyDoors: string[]; interior?: boolean }) {
   const { width: w, depth: d, height: h } = layout.building;
-  const bays = layout.doors.length;
   const sign = brandSign();
+  // A wall post between each pair of neighbouring doors, wherever the layout puts them.
+  const posts = layout.doors.slice(1).map((door, i) => (door.x + layout.doors[i].x) / 2);
   return (
     <group>
-      <Hall width={w} depth={d} height={h} />
-      {type === "hub" && <Hall width={w * 0.42} depth={d * 0.55} height={h + 1.5} position={[-w / 2 + w * 0.21, 0, -d / 2 - d * 0.27]} />}
-      {Array.from({ length: bays - 1 }, (_, i) => (
-        <Block key={`p${i}`} size={[0.4, h, 0.35]} position={[-w / 2 + (i + 1) * (w / bays), h / 2, d / 2 + 0.15]} color={palette.navy} />
-      ))}
-      <mesh position={[0, h - 1.7, d / 2 + 0.06]}>
-        <planeGeometry args={[6.4, 1.6]} />
-        <meshStandardMaterial map={sign} transparent roughness={0.5} />
-      </mesh>
+      <Hall width={w} depth={d} height={h} open={interior} />
+      {interior && <Zones zones={layout.zones} />}
+      {type === "hub" && <Hall width={w * 0.42} depth={d * 0.55} height={h + 1.5} position={[-w / 2 + w * 0.21, 0, -d / 2 - d * 0.27]} open={interior} />}
+      {!interior &&
+        posts.map((x) => (
+          <Block key={`p${x}`} size={[0.4, h, 0.35]} position={[x, h / 2, d / 2 + 0.15]} color={palette.navy} />
+        ))}
+      {!interior && (
+        <mesh position={[0, h - 1.7, d / 2 + 0.06]}>
+          <planeGeometry args={[6.4, 1.6]} />
+          <meshStandardMaterial map={sign} transparent roughness={0.5} />
+        </mesh>
+      )}
       {/* Side door used by putaway */}
       <Block size={[0.3, 3.4, 3.2]} position={[-w / 2 - 0.12, 1.7, d / 2 - 3]} color={palette.navy} />
       <Block size={[0.32, 3, 2.6]} position={[-w / 2 - 0.14, 1.5, d / 2 - 3]} color={palette.interior} cast={false} />
@@ -205,42 +255,16 @@ function Tree({ x, z, s = 1 }: { x: number; z: number; s?: number }) {
   );
 }
 
-function Lamp({ x, z }: { x: number; z: number }) {
-  return (
-    <group position={[x, 0, z]}>
-      <Block size={[0.14, 5, 0.14]} position={[0, 2.5, 0]} color="#e2e8f0" />
-      <Block size={[0.1, 0.1, 1.2]} position={[0, 4.95, -0.55]} color="#e2e8f0" cast={false} />
-      <Block size={[0.32, 0.14, 0.6]} position={[0, 4.88, -1.1]} color="#cbd5e1" cast={false} />
-      <mesh position={[0, 4.8, -1.1]} rotation={[Math.PI / 2, 0, 0]}>
-        <planeGeometry args={[0.26, 0.5]} />
-        <meshStandardMaterial color="#fff7d6" emissive="#fff3c4" emissiveIntensity={0.6} side={DoubleSide} />
-      </mesh>
-    </group>
-  );
-}
-
 export function Ground({ layout }: { layout: SiteLayout }) {
   const { width: w, depth: d } = layout.building;
   const { roadZ } = layout;
   const lane = d / 2 + 15;
-  const x0 = -w / 2 - 42;
-  const x1 = w / 2 + 26;
-  const z0 = -d / 2 - 16;
+  const { x0, x1, z0 } = padBounds(layout);
   const parkZ0 = layout.chargers[0].pos[1] - 1.6;
   const parkZ1 = layout.chargers[layout.chargers.length - 1].pos[1] + 1.6;
   return (
     <group>
-      <Flat x={0} z={roadZ - 20} w={700} d={500} color={palette.ground} y={0} />
       <Flat x={(x0 + x1) / 2} z={(z0 + roadZ - 5) / 2} w={x1 - x0} d={roadZ - 5 - z0} color={palette.pad} y={0.01} />
-      {/* Street: asphalt, edge lines, centre dashes, raised sidewalks */}
-      <Flat x={0} z={roadZ} w={700} d={10} color={palette.road} />
-      <Flat x={0} z={roadZ - 4.6} w={700} d={0.18} color="#ffffff" y={0.03} />
-      <Flat x={0} z={roadZ + 4.6} w={700} d={0.18} color="#ffffff" y={0.03} />
-      {Array.from({ length: 70 }, (_, i) => (
-        <Flat key={`r${i}`} x={-207 + i * 6} z={roadZ} w={3} d={0.22} color="#ffffff" y={0.03} />
-      ))}
-      <Block size={[700, 0.14, 3]} position={[0, 0.07, roadZ + 6.5]} color={palette.sidewalk} cast={false} />
-      <Block size={[700, 0.16, 0.25]} position={[0, 0.08, roadZ + 5.1]} color={palette.curb} cast={false} />
       {/* Yard: forklift lane, dock bays, staging slots, forklift parking */}
       {Array.from({ length: Math.floor((x1 - x0 - 8) / 3) }, (_, i) => (
         <Flat key={`l${i}`} x={x0 + 4 + i * 3} z={lane} w={1.5} d={0.15} color="#c5cedc" y={0.03} />
@@ -268,15 +292,8 @@ export function Ground({ layout }: { layout: SiteLayout }) {
 export function Street({ layout, type }: { layout: SiteLayout; type: SiteType }) {
   const { width: w, depth: d } = layout.building;
   const { roadZ, gateX } = layout;
-  const lamps = Array.from({ length: 16 }, (_, i) => -150 + i * 20);
   return (
     <group>
-      {lamps.map((x) => (
-        <Lamp key={x} x={x} z={roadZ + 6.9} />
-      ))}
-      {lamps.map((x, i) => (
-        <Tree key={`s${x}`} x={x + 10} z={roadZ + 10.5} s={0.85 + (i % 3) * 0.12} />
-      ))}
       {layout.trees.map(([x, z], i) => (
         <Tree key={i} x={x} z={z} s={0.9 + (i % 3) * 0.15} />
       ))}
